@@ -1,0 +1,156 @@
+#!/usr/bin/python3
+from sys import exit, argv
+from dnslib.dns import *
+from http.client import HTTPConnection
+from math import sin, cos, sqrt, atan2, radians
+from urllib.request import urlopen
+from random import choice
+
+NODES = []
+NODE_LOCATIONS = {}
+
+file = open('ec2-hosts.txt', 'r')
+lines = file.readlines()
+for replica_url in lines:
+    NODES.append(replica_url.strip())
+
+
+def parse_command_line():
+    args = argv
+    if len(args) != 5:
+        exit("Program is missing port number and/or CDN-specific name.")
+    port = int(args[2])
+    cdn_name = args[4]
+
+    return [port, cdn_name]
+
+
+def get_ip(replica_server_url):
+    try:
+        result_tuple = socket.gethostbyname_ex(replica_server_url)
+        ip = result_tuple[2][0]
+        return ip
+    except socket.error as msg:
+        exit("Something went wrong with connecting: " + str(msg))
+
+
+# Calculate the great circle distance (in miles) between two points on the earth (specified in decimal degrees)
+def get_distance(source, world_ip):
+    lat_source, long_source = source
+    lat_world_ip, long_world_ip = world_ip
+
+    # convert decimal degrees to radians
+    lat_source_radians = radians(lat_source)
+    long_source_radians = radians(long_source)
+    lat_world_ip_radians = radians(lat_world_ip)
+    long_world_ip_radians = radians(long_world_ip)
+
+    # Earth's radius
+    earth_radius = 6371 #3956 miles
+
+    # get differences for latitude points and longitude points
+    lat_diff = abs(lat_source_radians - lat_world_ip_radians)
+    long_diff = abs(long_source_radians - long_world_ip_radians)
+
+    # haversine formula
+    a = sin(lat_diff / 2)**2 + cos(lat_source_radians) * cos(lat_world_ip_radians) * sin(long_diff / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+
+    return earth_radius * c
+
+
+# IP Geolocation
+def get_location(ipaddress):
+    # Source for IP Address data
+    key = "6672ec74e413a6d60a1cd9d4e4df51f98b63d58b3bc0c1919e27d690cb583ddf"
+    url = 'http://api.ipinfodb.com/v3/ip-city/?key=' + key + '&ip=' + str(ipaddress)
+    try:
+        response = urlopen(url)
+    except:
+        print("Sleeping for a second...")
+        time.sleep(2)
+        response = urlopen(url)
+    data = response.read().decode('UTF-8').split(';')
+    latitude = float(data[8])
+    longitude = float(data[9])
+    return latitude, longitude
+
+
+def get_min_rtt(port):
+    nodes_and_rtt = {}
+    for node_url in NODES:
+        node_ip = get_ip(node_url)
+        start_time = time.time()
+        conn = HTTPConnection(node_url, port)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        end_time = time.time()
+        # Calculate elapsed time
+        rtt = str(end_time - start_time)
+        nodes_and_rtt[node_ip] = rtt
+    return min(nodes_and_rtt, key=nodes_and_rtt.get)
+
+
+def get_closest_replica(source_ip):
+    distances_to_nodes = {}
+    source_location = get_location(source_ip)
+    for node_and_loc in NODE_LOCATIONS.items():
+        distances_to_nodes[node_and_loc[0]] = get_distance(source_location, node_and_loc[1])
+    return min(distances_to_nodes, key=distances_to_nodes.get)
+
+
+def extract_dns_query(dns_query, source_ip, port):
+    closest_replica_ip = get_closest_replica(source_ip)
+    print("fastest replica for source_ip {} is {}".format(source_ip, closest_replica_ip))
+    response = dns_query.reply()
+    response.add_answer(RR(dns_query.q.qname, QTYPE.A,
+                        rdata=A(closest_replica_ip), ttl=60))
+    return response.pack()
+
+
+def get_connections(s, port, name):
+    data, addr = s.recvfrom(600)
+    source_ip = addr[0]
+    print("Address is: " + source_ip)
+    try:
+        dns_query = DNSRecord.parse(data)
+    except DNSError:
+        # ignore packets that are not properly-formed DNS queries
+        print("Got a non-DNS query packet... ignoring...")
+        return
+    # If it's not an Answer query, ignore it
+    if dns_query.q.qtype != QTYPE.A:
+        print("Got a non-Answer query... ignoring...")
+        return
+    # If the name being queried isn't the given <name>, ignore it
+    if dns_query.q.qname != name:
+        print("Got a non-valid name query... ignoring...")
+        return
+    # otherwise, send the DNS query to be parsed and responded to
+    print("It is an okay packet. Sending to be analyzed.")
+    dns_response = extract_dns_query(dns_query, source_ip, port)
+    s.sendto(dns_response, addr)
+
+
+def main():
+    params = parse_command_line()
+    port = params[0]
+    name = params[1]
+
+    for node in NODES:
+        node_ip = get_ip(node)
+        NODE_LOCATIONS[node_ip] = get_location(node_ip)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        print("About to bind...")
+        s.bind(('0.0.0.0', port))
+        print("Bound!")
+        while True:
+            get_connections(s, port, name)
+            #thread.start_new_thread(get_connections, (s, port, name))
+            #threading.Thread(target=get_connections,args=(s, port, name,)).start()
+
+# multithreading to serve each client
+#start_new_thread(get_connections,(s, port, name))
+
+main()

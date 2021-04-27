@@ -1,0 +1,45 @@
+#!/usr/bin/sh
+# OPTIND is the index of the next argument to be processed (starting index is 1)
+OPTIND=1
+# Initializing values
+port=""
+originserver=""
+cdnname=""
+username=""
+key=""
+# Parse the command line arguments using getopts
+# https://sookocheff.com/post/bash/parsing-bash-script-arguments-with-shopts/
+while getopts "p:o:n:u:i:" opts; do
+	case $opts in
+		p) port=$OPTARG
+			;;
+		o) originserver=$OPTARG
+			;;
+		n) cdnname=$OPTARG
+			;;
+		u) username=$OPTARG
+			;;
+		i) key=$OPTARG
+			;;
+	esac
+done
+
+for host in $(cat ec2-hosts.txt); do
+    echo "Launching web server on node $host..."
+    ssh -i "$key" $username@$host "chmod +x httpserver" </dev/null
+    ssh -f -i "$key" $username@$host "nohup ./httpserver -p $port -o $originserver 2>&1 &" </dev/null
+done
+
+dnsserverip="129.10.117.187"
+if [ "$dnsserverip" == $(hostname -I) ];
+then
+    echo "Launching DNS server..."
+    chmod +x dnsserver
+    nohup ./dnsserver -p $port -n $cdnname 2>&1 &
+else
+    echo "Launching DNS server..."
+    ssh $username@cs5700cdnproject.ccs.neu.edu "chmod +x dnsserver" </dev/null
+    ssh $username@cs5700cdnproject.ccs.neu.edu "nohup ./dnsserver -p $port -n $cdnname 2>&1 &" </dev/null
+fi
+
+exit 1

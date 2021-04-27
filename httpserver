@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+
+from socket import gethostbyname, gethostname
+from gzip import open as gzip_open, compress, decompress
+from os import path, listdir, remove
+from pickle import load
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from sys import exit, argv, modules
+import threading
+
+
+def get_from_cache(path_name, dir_name):
+    if path.exists(dir_name+"/"+path_name):
+        with gzip_open(dir_name+"/"+path_name, mode='rb') as file:
+            return file.read()
+
+    else:
+        return False
+
+
+def insert_cache(path, content, dir_name):
+    try:
+        with gzip_open(dir_name+"/"+path, mode='wb') as file:
+            try:
+                file.write(content)
+            except OSError:
+                try:
+                    file.close()
+                    remove(dir_name + "/" + path)
+                    pass
+                    print("Not enough space to save this file. Moving on.")
+                except OSError:
+                    pass
+
+    except MemoryError:
+        remove(dir_name+"/"+path)
+        print("File too big to add to cache. Moving on.")
+
+
+def can_fit_mini_cache(content):
+    mini_cache_cur_size = sum(path.getsize('mini_cache_dir/'+f) for f in listdir(
+        'mini_cache_dir') if path.isfile('mini_cache_dir/'+f))
+    if mini_cache_cur_size + len(content) < 2000000:
+        del mini_cache_cur_size
+        return True
+
+    del mini_cache_cur_size
+    return False
+
+
+def connect_origin(host):
+    try:
+        conn = HTTPConnection(host, 8080)
+        return conn
+    except Exception as msg:
+        sys.exit("Something when wrong with the socket connection: " + str(msg))
+
+
+def send_get_to_origin(origin_server, path):
+    origin_server.request("GET", path)
+    resp = origin_server.getresponse()
+    if resp.status == "404":
+        return b'File Not Found'
+    try:
+        return resp.read()
+    except MemoryError:
+        return b'File too big to fetch at this time'
+
+
+def update_hit_count(path, hit_count):
+    if path not in hit_count:
+        hit_count[path] = 1
+    else:
+        hit_count[path] = hit_count[path] + 1
+    return hit_count
+
+
+def update_miss_count(path, miss_count):
+    if path not in miss_count:
+        miss_count[path] = 0
+
+    for key in miss_count.keys():
+        if key is not path:
+            miss_count[key] = miss_count[key] + 1
+
+    return miss_count
+
+
+def any_hit_count_max(hit_count, miss_count):
+    max_hit_counts_paths = dict((k, v) for k, v in hit_count.items() if v >= 5)
+    # No paths reached threshold for hit count
+    if len(max_hit_counts_paths) == 0:
+        del max_hit_counts_paths
+        return False
+    # One path has reached threshold
+    elif len(max_hit_counts_paths) == 1:
+        del max_hit_counts_paths
+        return list(max_hit_counts_paths.keys())[0]
+    # More than one path reached threshold, return one with lowest miss count
+    else:
+        del max_hit_counts_paths
+        miss_counts_of_max_hit_counts_paths = {}
+        for k, v in max_hit_counts_paths:
+            miss_counts_of_max_hit_counts_paths[k] = miss_count[k]
+
+        return min(miss_counts_of_max_hit_counts_paths, key=miss_counts_of_max_hit_counts_paths.get)
+
+
+def make_room_in_cache(content, queue_history, popular_dict):
+    cache_cur_size = sum(path.getsize(f)
+                         for f in listdir('cache_dir') if path.isfile(f))
+    if (cache_cur_size + len(content)) < 4000000:
+        del cache_cur_size
+        return
+
+    else:
+        while cache_cur_size + len(content) > 4000000:
+            # Get one path that are not in popular dict and is in cache_dir
+            not_popular_file_in_cache = get_not_popular_file_in_cache_dir(
+                popular_dict)
+            if not_popular_file_in_cache not in queue_history:
+                remove('cache_dir/'+not_popular_file_in_cache)
+                cache_cur_size = sum(path.getsize(f) for f in listdir(
+                    'cache_dir') if path.isfile(f))
+        del cache_cur_size
+        del not_popular_file_in_cache
+
+
+def get_not_popular_file_in_cache_dir(popular_dict):
+    for filename in listdir("cache_dir"):
+        if "/"+filename not in popular_dict:
+            return filename
+
+
+def delete_from_mini_cache(path):
+    remove("mini_cache_dir"+path)
+
+
+def get_highest_miss_count(miss_count):
+    return max(miss_count, key=miss_count.get)
+
+
+def make_room_in_mini_cache(content, miss_count, hit_count):
+    mini_cache_cur_size = sum(path.getsize("mini_cache_dir/"+f) for f in listdir(
+        'mini_cache_dir') if path.isfile("mini_cache_dir/"+f))
+    while mini_cache_cur_size + len(content) > 2000000:
+        # print("in while loop, can't fit in mini cache currently")
+        # Get highest miss count path
+        highest_miss_count_path = get_highest_miss_count(miss_count)
+        # print("Removing: " + highest_miss_count_path)
+        remove("mini_cache_dir/"+highest_miss_count_path)
+        del hit_count[highest_miss_count_path]
+        del miss_count[highest_miss_count_path]
+        mini_cache_cur_size = sum(path.getsize(f) for f in listdir(
+            'mini_cache_dir') if path.isfile(f))
+
+    del mini_cache_cur_size
+    del highest_miss_count_path
+    return [hit_count, miss_count]
+
+# https://pythonbasics.org/webserver/
+
+
+def create_server(origin_server, popular_dict, queue_history):
+    class Server(BaseHTTPRequestHandler):
+        hit_count = {}
+        miss_count = {}
+        chars = "\\/*<>?|:\""
+
+        def send_content_to_client(self, content):
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(content)
+
+        def do_GET(self):
+            print("In Get")
+            valid_char_path = ""
+            for c in self.chars:
+                valid_char_path = self.path.replace(c, "_")
+            if len(queue_history) == 30:
+                queue_history.pop(0)
+            # print(queue_history)
+            valid_char_path = valid_char_path.replace("/wiki", "")
+            queue_history.append(valid_char_path)
+            content = get_from_cache(valid_char_path, 'cache_dir')
+            # In Cache_Dir
+            if content:
+                print("In cache dir")
+                try:
+                    self.send_content_to_client(decompress(content))
+                except MemoryError:
+                    print("Sending compressed version. Moving on.")
+                    self.send_content_to_client(content)
+                del content
+            # Not in Cache Dir
+            else:
+                print("Requested file not in our cache...")
+                del content
+                if self.path == '/grading/beacon':
+                    self.send_response(204)
+                    self.send_header("Content-type", "text/html")
+                    self.end_headers()
+                # Not Grading Beacon
+                else:
+                    # print("Not in grading beacon")
+                    content = get_from_cache(valid_char_path, 'mini_cache_dir')
+                    # In Mini Cache
+                    if content:
+                        # print("is in mini cache")
+                        self.send_content_to_client(decompress(content))
+                        self.hit_count = update_hit_count(
+                            valid_char_path, self.hit_count)
+                        self.miss_count = update_miss_count(
+                            valid_char_path, self.miss_count)
+                        del content
+                    # Not in Mini Cache
+                    else:
+                        print("Content not in our mini cache either... Sending a GET to the origin.")
+                        # print(miss_count)
+                        content = send_get_to_origin(origin_server, self.path)
+                        self.send_content_to_client(content)
+                        try:
+                            content = compress(content)
+                        except MemoryError or ValueError:
+                            print("File too big to compress-- not saving to mini cache. Moving on.")
+                            del content
+                            return
+
+                        # Can Fit in Mini Cache, without removals
+                        if can_fit_mini_cache(content):
+                            # print("can fit in mini cache, without removals")
+                            insert_cache(valid_char_path, content,
+                                         "mini_cache_dir")
+                            self.hit_count = update_hit_count(
+                                valid_char_path, self.hit_count)
+                            self.miss_count = update_miss_count(
+                                valid_char_path, self.miss_count)
+                            del content
+                        # Mini Cache Full
+                        else:
+                            # print("mini cache full")
+                            hit_count_over_path = any_hit_count_max(
+                                self.hit_count, self.miss_count)
+                            # If content in mini cache has reached max hit count
+                            if hit_count_over_path:
+                                hit_count_over_content = get_from_cache(
+                                    hit_count_over_path, "mini_cache_dir")
+                                # print("Something in mini cache has 5 hit count")
+                                make_room_in_cache(
+                                    hit_count_over_content, queue_history, popular_dict)
+                                insert_cache(hit_count_over_path,
+                                             hit_count_over_content, "cache_dir")
+                                delete_from_mini_cache(hit_count_over_path)
+                                del self.hit_count[hit_count_over_path]
+                                del self.miss_count[hit_count_over_path]
+                                del hit_count_over_content
+                                del hit_count_over_path
+                                insert_cache(valid_char_path, content,
+                                             "mini_cache_dir")
+                                self.hit_count[valid_char_path] = 1
+                                self.miss_count[valid_char_path] = 0
+
+                            # No content has reached max hit count, remove highest miss count
+                            else:
+                                # print(
+                                #     "No content in mini cache has 5 hit count, remove highest miss count")
+                                updated_hit_miss_count = make_room_in_mini_cache(
+                                    content, self.miss_count, self.hit_count)
+                                self.hit_count = updated_hit_miss_count[0]
+                                self.miss_count = updated_hit_miss_count[1]
+                                del updated_hit_miss_count
+                                insert_cache(valid_char_path, content,
+                                             "mini_cache_dir")
+                                self.hit_count[valid_char_path] = 1
+                                self.miss_count[valid_char_path] = 0
+                            del content
+            # print(self.hit_count)
+
+    return Server
+
+# https://www.sqlitetutorial.net/sqlite-python/create-tables/
+
+
+def get_node_IP():
+    hostname = gethostname()
+    local_ip = gethostbyname(hostname)
+    del modules["socket"]
+    return local_ip
+
+
+def main():
+    queue_history = []
+    port = int(argv[2])
+
+    popular_file = open("popular", "rb")
+    popular_dict = load(popular_file)
+    popular_file.close()
+    remove("popular")
+    del popular_file
+    del modules["pickle"]
+
+    origin_server = connect_origin(argv[4])
+    # del sys
+    print("Connected Origin Server")
+
+    # hostName = "localhost"
+    hostName = get_node_IP()
+    CreateServer = create_server(origin_server, popular_dict, queue_history)
+    http_server = HTTPServer((hostName, port), CreateServer)
+
+    try:
+        http_server.serve_forever()
+        #daemon = threading.Thread(name="daemon_server", target=create_server, args=(origin_server, popular_dict, queue_history))
+        #daemon.setDaemon(true)
+        #daemon.start()
+    except KeyboardInterrupt:
+        pass
+    http_server.server_close()
+
+
+main()

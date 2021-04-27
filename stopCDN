@@ -1,0 +1,44 @@
+#!/usr/bin/sh
+# OPTIND is the index of the next argument to be processed (starting index is 1)
+OPTIND=1
+# Initializing values
+port=""
+originserver=""
+cdnname=""
+username=""
+key=""
+
+# Parse the command line arguments using getopts
+# https://sookocheff.com/post/bash/parsing-bash-script-arguments-with-shopts/
+while getopts "p:o:n:u:i:" opts; do
+	case $opts in
+		p) port=$OPTARG
+			;;
+		o) originserver=$OPTARG
+			;;
+		n) cdnname=$OPTARG
+			;;
+		u) username=$OPTARG
+			;;
+		i) key=$OPTARG
+			;;
+	esac
+done
+
+dnsserverip="129.10.117.187"
+if [ "$dnsserverip" == $(hostname -I) ];
+then
+    echo "Stopping DNS server"
+    killall /usr/bin/python3
+else
+    echo "Stopping DNS server"
+    ssh $username@cs5700cdnproject.ccs.neu.edu "killall /usr/bin/python3" </dev/null
+fi
+
+for host in $(cat ec2-hosts.txt); do
+    echo "Stopping programs on node $host"
+    ssh -f -i "$key" $username@$host "killall /usr/bin/python3.8" </dev/null
+    echo "Complete."
+done
+
+exit 1

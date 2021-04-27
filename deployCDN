@@ -1,0 +1,53 @@
+#!/usr/bin/sh
+
+# OPTIND is the index of the next argument to be processed (starting index is 1)
+OPTIND=1
+# Initializing values
+port=""
+originserver=""
+cdnname=""
+username=""
+key=""
+
+# Parse the command line arguments using getopts
+# https://sookocheff.com/post/bash/parsing-bash-script-arguments-with-shopts/
+while getopts "p:o:n:u:i:" opts; do
+	case $opts in
+		p) port=$OPTARG
+			;;
+		o) originserver=$OPTARG
+			;;
+		n) cdnname=$OPTARG
+			;;
+		u) username=$OPTARG
+			;;
+		i) key=$OPTARG
+			;;
+	esac
+done
+
+dnsserverip="129.10.117.187"
+if [ "$dnsserverip" == $(hostname -I) ];
+then
+    python3 makepopularlist.py
+else
+    echo "Not on cs5700cdnproject.ccs.neu.edu... will be prompted for login"
+    scp dnsserver makepopularlist.py $username@cs5700cdnproject.ccs.neu.edu:
+    ssh $username@cs5700cdnproject.ccs.neu.edu "python3 makepopularlist.py" </dev/null
+    scp $username@cs5700cdnproject.ccs.neu.edu:popular popular
+fi
+
+python3 createlocalfile.py cs5700cdnorigin.ccs.neu.edu
+
+mkdir mini_cache_dir
+
+for host in $(cat ec2-hosts.txt); do
+    ssh -i "$key" $username@$host "rm -rf *;" </dev/null
+    echo "Wiped the node to prep for file transfer"
+    echo "Transferring all necessary files to $host"
+    scp -i "$key" -r cache_dir mini_cache_dir httpserver popular $username@$host: &
+    echo "Completed"
+done
+
+wait
+exit 1
